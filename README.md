@@ -3,7 +3,7 @@ Converts kubernetes yaml files to json files.
 
 ## installation
 
-`go install github.com/xonvanetta/yamltojson`
+`go install github.com/xonvanetta/yamltojson@latest`
 
 or this if you don't have go 1.17+
 
