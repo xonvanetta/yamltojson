@@ -1,153 +1,78 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/icza/dyno"
-	"github.com/koding/multiconfig"
 	yaml2 "sigs.k8s.io/yaml"
 )
 
-var yamlDelim = []byte("---")
-var kind = regexp.MustCompile(`.*kind: (.*?)\n`)
-var name = regexp.MustCompile(`.*  name: (.*?)\n`)
-
-type config struct {
-	StartBufferSize  uint64
-	MaxScanTokenSize int
-	File             string
-}
-
-func isYaml(data []byte) bool {
-	if strings.TrimSpace(string(data)) == string(yamlDelim) {
-		return false
-	}
-	var yamlObject interface{}
-	return yaml2.Unmarshal(data, &yamlObject) == nil
-}
-
-func yamlAdvancedSplit(data []byte, atEOF bool) (advance int, token []byte, err error) {
-
-	firstYamlDelim := bytes.Index(data, yamlDelim)
-	if firstYamlDelim == -1 && atEOF == true {
-		return 0, data, bufio.ErrFinalToken
-	}
-	if firstYamlDelim == -1 && atEOF == false {
-		return 0, nil, nil
-	}
-
-	index := firstYamlDelim + 3
-	shouldReturn := false
-	if isYaml(data[:index]) {
-		shouldReturn = true
-		//fmt.Println(string(data[:index]))
-		//fmt.Println(string(data))
-		//fmt.Println("text")
-		//return index, data[:index], nil
-	}
-
-	nextYamlDelim := bytes.Index(data[index:], yamlDelim)
-	if nextYamlDelim == -1 && shouldReturn && atEOF == true {
-		return 0, data[:index], bufio.ErrFinalToken
-	}
-	if shouldReturn {
-		return len(data[:index]), data[:index], nil
-	}
-
-	//fmt.Println(index, nextYamlDelim)
-	//fmt.Println(atEOF)
-	//fmt.Println(len(data[firstYamlDelim:]))
-	if nextYamlDelim == -1 && atEOF == true {
-		return 0, data[firstYamlDelim:], bufio.ErrFinalToken
-	}
-	if nextYamlDelim == -1 && atEOF == false {
-		return 0, nil, nil
-	}
-	nextIndex := nextYamlDelim + index
-	return nextIndex, data[firstYamlDelim:nextIndex], nil
-}
-
-func yamlSplit(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	firstYamlDelim := bytes.Index(data, yamlDelim)
-	index := firstYamlDelim + 3
-	nextYamlDelim := bytes.Index(data[index:], yamlDelim)
-	if nextYamlDelim == -1 && atEOF == true {
-		return 0, data[firstYamlDelim:], bufio.ErrFinalToken
-	}
-	if nextYamlDelim == -1 && atEOF == false {
-		return 0, nil, nil
-	}
-	nextIndex := nextYamlDelim + index
-	return nextIndex, data[firstYamlDelim:nextIndex], nil
-}
-
 func main() {
-	config := &config{
-		StartBufferSize:  64 * 1024,
-		MaxScanTokenSize: 64 * 1024 * 1024, //64MB max allocation size
-	}
+	filePath := ""
+	flag.StringVar(&filePath, "file", "", "yaml document to convert to json")
+	flag.StringVar(&filePath, "f", "", "yaml document to convert to json")
 
-	multiconfig.MustLoad(config)
-
-	if config.File == "" {
+	flag.Parse()
+	if filePath == "" {
 		log.Fatal("missing file to convert")
 	}
 
-	file, err := os.Open(config.File)
+	file, err := os.Open(filePath)
 	if err != nil {
 		log.Fatalf("failed to open file: %s", err)
 	}
 	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-
-	buf := make([]byte, config.StartBufferSize)
-	scanner.Buffer(buf, config.MaxScanTokenSize)
-
-	scanner.Split(yamlSplit)
+	b, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("failed to read file: %s", err)
+	}
 
 	jsonMap := map[string]interface{}{}
 
-	for scanner.Scan() {
-		yamlDocument := scanner.Text()
+	for _, yamlBytes := range bytes.Split(b, []byte("\n---")) {
+		doc := &struct {
+			Kind     string
+			Metadata struct {
+				Name string
+			}
+		}{}
 
-		//fmt.Println(yaml)
-		names := name.FindStringSubmatch(yamlDocument)
-		//TODO check error
-		name := names[1]
+		err := yaml2.Unmarshal(yamlBytes, doc)
+		if err != nil {
+			log.Fatalf("failed to unmrshal doc")
+		}
+		if doc.Kind == "" && doc.Metadata.Name == "" {
+			continue
+		}
 
-		kinds := kind.FindStringSubmatch(yamlDocument)
-		//TODO check error
-		kind := kinds[1]
-		fmt.Println(name, kind)
-
-		if kind == "CustomResourceDefinition" || kind == "Namespace" {
+		fmt.Println(doc.Metadata.Name, doc.Kind)
+		name := doc.Metadata.Name
+		if doc.Kind == "CustomResourceDefinition" || doc.Kind == "Namespace" {
 			name = "0" + name
 		}
 
-		key := name + kind
+		key := name + doc.Kind
 		_, ok := jsonMap[key]
 		if ok {
 			log.Fatalf("dublicate found in jsonMap: %s", key)
 		}
 
 		var yamlObject interface{}
-		err := yaml2.Unmarshal([]byte(yamlDocument), &yamlObject)
+		err = yaml2.Unmarshal(yamlBytes, &yamlObject)
 		if err != nil {
-			log.Fatalf("failed to yaml2 unmarshal document: %s, raw block: %s", err, yamlDocument)
+			log.Fatalf("failed to yaml2 unmarshal document: %s, raw block: %s", err, yamlBytes)
 		}
 
 		jsonMap[key] = dyno.ConvertMapI2MapS(yamlObject)
 	}
-
-	strings.Replace(file.Name(), ".yaml", ".json", 1)
 
 	jsonFile, err := os.Create(fileName(file.Name()))
 	if err != nil {
