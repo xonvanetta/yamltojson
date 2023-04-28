@@ -3,25 +3,34 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"flag"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"os"
 	"strings"
 
 	"github.com/icza/dyno"
-	yaml2 "sigs.k8s.io/yaml"
+	"github.com/koding/multiconfig"
+	"gopkg.in/yaml.v3"
 )
 
-func main() {
-	filePath := ""
-	flag.StringVar(&filePath, "file", "", "yaml document to convert to json")
-	flag.StringVar(&filePath, "f", "", "yaml document to convert to json")
+type Config struct {
+	NamePattern  string
+	SeperateCRDs bool
+	File         string
+}
 
-	flag.Parse()
+func main() {
+	config := &Config{
+		NamePattern: `{{if or (eq .Kind "CustomResourceDefinition") (eq .Kind "Namespace")}}0{{end}}{{ .Metadata.Name }}-{{ .Kind }}`,
+	}
+
+	multiconfig.MustLoad(config)
+
+	filePath := config.File
 	if filePath == "" {
-		log.Fatal("missing file to convert")
+		log.Fatal("missing first arg for file")
 	}
 
 	file, err := os.Open(filePath)
@@ -35,17 +44,23 @@ func main() {
 		log.Fatalf("failed to read file: %s", err)
 	}
 
+	tmpl, err := template.New("name").Parse(config.NamePattern)
+	if err != nil {
+		log.Fatalf("failed to parse template for name: %s", err)
+	}
 	jsonMap := map[string]interface{}{}
+	crdMap := map[string]interface{}{}
 
 	for _, yamlBytes := range bytes.Split(b, []byte("\n---")) {
-		doc := &struct {
+		doc := &struct { //maybe map string to easier use with pattern
 			Kind     string
 			Metadata struct {
-				Name string
+				Name      string
+				Namespace string
 			}
 		}{}
 
-		err := yaml2.Unmarshal(yamlBytes, doc)
+		err := yaml.Unmarshal(yamlBytes, doc)
 		if err != nil {
 			log.Fatalf("failed to unmrshal doc")
 		}
@@ -54,45 +69,61 @@ func main() {
 		}
 
 		fmt.Println(doc.Metadata.Name, doc.Kind)
-		name := doc.Metadata.Name
-		if doc.Kind == "CustomResourceDefinition" || doc.Kind == "Namespace" {
-			name = "0" + name
+
+		b := &bytes.Buffer{}
+		err = tmpl.Execute(b, doc)
+		if err != nil {
+			log.Fatalf("failed to execute template: %s", err)
 		}
 
-		key := name + doc.Kind
+		key := b.String()
 		_, ok := jsonMap[key]
 		if ok {
 			log.Fatalf("dublicate found in jsonMap: %s", key)
 		}
 
 		var yamlObject interface{}
-		err = yaml2.Unmarshal(yamlBytes, &yamlObject)
+		err = yaml.Unmarshal(yamlBytes, &yamlObject)
 		if err != nil {
 			log.Fatalf("failed to yaml2 unmarshal document: %s, raw block: %s", err, yamlBytes)
 		}
 
-		jsonMap[key] = dyno.ConvertMapI2MapS(yamlObject)
+		if config.SeperateCRDs && doc.Kind == "CustomResourceDefinition" {
+			crdMap[key] = dyno.ConvertMapI2MapS(yamlObject)
+		} else {
+			jsonMap[key] = dyno.ConvertMapI2MapS(yamlObject)
+		}
+	}
+	err = saveAsJson(replaceYamlToJson(file.Name())+".json", jsonMap)
+	if err != nil {
+		log.Fatalf("failed to save as json: %s", err)
 	}
 
-	jsonFile, err := os.Create(fileName(file.Name()))
+	if config.SeperateCRDs {
+		err := saveAsJson(replaceYamlToJson(file.Name()+"-crd.json"), crdMap)
+		if err != nil {
+			log.Fatalf("failed to save as json: %s", err)
+		}
+	}
+}
+
+func saveAsJson(name string, data interface{}) error {
+	jsonFile, err := os.Create(name)
 	if err != nil {
-		log.Fatalf("failed to create file: %s", err)
+		return fmt.Errorf("failed to create file: %s", err)
 	}
 	defer jsonFile.Close()
 
-	err = json.NewEncoder(jsonFile).Encode(jsonMap)
+	err = json.NewEncoder(jsonFile).Encode(data)
 	if err != nil {
-		log.Fatalf("failed to encode jsonMap to json file: %s", err)
+		return fmt.Errorf("failed to encode jsonMap to json file: %s", err)
 	}
 	fmt.Println("json file has been written", jsonFile.Name())
+	return nil
 }
 
-func fileName(name string) string {
-	if strings.HasSuffix(name, ".yaml") {
-		return strings.Replace(name, ".yaml", ".json", 1)
-	}
-	if strings.HasSuffix(name, ".yml") {
-		return strings.Replace(name, ".yml", ".json", 1)
-	}
-	return name + ".json"
+func replaceYamlToJson(name string) string {
+	name = strings.Replace(name, ".yaml", "", 1)
+	name = strings.Replace(name, ".yml", "", 1)
+	return name
 }
